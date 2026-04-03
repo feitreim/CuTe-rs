@@ -9,31 +9,52 @@ pub enum HTuple<T> {
     Tuple(Vec<HTuple<T>>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Slice {
     Idx(u64),
     Tuple(Vec<Slice>),
-    All(),
+    All,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutError {
+    NotCongruent,
+    Divisibility,
+}
+
+impl fmt::Display for LayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LayoutError::NotCongruent => write!(f, "shape and stride not congruent"),
+            LayoutError::Divisibility => write!(f, "stride/shape divisibility violated"),
+        }
+    }
+}
+
+impl std::error::Error for LayoutError {}
 
 pub type Shape = HTuple<u64>;
 pub type Coord = HTuple<u64>;
 pub type Stride = HTuple<i64>;
 
 /// declare shapes like shape!(4, (3, 5))
+#[macro_export]
 macro_rules! shape {
-    (($($inner:tt),+)) => { HTuple::Tuple(vec![$(shape!($inner)),+]) };
-    ($val:expr)         => { HTuple::Leaf($val as u64) };
+    (($($inner:tt),+)) => { $crate::HTuple::Tuple(vec![$($crate::shape!($inner)),+]) };
+    ($val:expr)         => { $crate::HTuple::Leaf($val as u64) };
 }
 
+#[macro_export]
 macro_rules! stride {
-    (($($inner:tt),+)) => { HTuple::Tuple(vec![$(stride!($inner)),+]) };
-    ($val:expr)         => { HTuple::Leaf($val as i64) };
+    (($($inner:tt),+)) => { $crate::HTuple::Tuple(vec![$($crate::stride!($inner)),+]) };
+    ($val:expr)         => { $crate::HTuple::Leaf($val as i64) };
 }
 
-macro_rules! slice {
-    (_)                 => { Slice::All() };
-    (($($inner:tt),+)) => { Slice::Tuple(vec![$(slice!($inner)),+]) };
-    ($val:expr)         => { Slice::Idx($val as u64) };
+#[macro_export]
+macro_rules! sl {
+    (_)                 => { $crate::Slice::All };
+    (($($inner:tt),+)) => { $crate::Slice::Tuple(vec![$($crate::sl!($inner)),+]) };
+    ($val:expr)         => { $crate::Slice::Idx($val as u64) };
 }
 
 impl<T> HTuple<T> {
@@ -158,19 +179,18 @@ pub fn htuple2slice(coord: Coord) -> Slice {
 // ------------------------------------------------------------------
 // Layout definition and functions
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     shape: Shape,
     stride: Stride,
 }
 
 impl Layout {
-    pub fn new(shape: Shape, stride: Stride) -> Self {
-        assert!(
-            congruent(&shape, &stride),
-            "shape and stride not congruent."
-        );
-        Layout { shape, stride }
+    pub fn new(shape: Shape, stride: Stride) -> Result<Self, LayoutError> {
+        if !congruent(&shape, &stride) {
+            return Err(LayoutError::NotCongruent);
+        }
+        Ok(Layout { shape, stride })
     }
 
     /// evaluate layout for an integral coordinate
@@ -186,10 +206,10 @@ impl Layout {
     }
 
     pub fn rank(&self) -> usize { self.shape.rank() }
-
     pub fn depth(&self) -> usize { self.shape.depth() }
-
     pub fn size(&self) -> u64 { size(&self.shape) }
+    pub fn shape(&self) -> &Shape { &self.shape }
+    pub fn stride(&self) -> &Stride { &self.stride }
 
     pub fn sublayout(&self, i: usize) -> Layout {
         match (&self.shape, &self.stride) {
@@ -202,40 +222,61 @@ impl Layout {
     }
 
     pub fn slice(&self, args: &Slice) -> (i64, Layout) {
-        match (args, &self.shape, &self.stride) {
-            (Slice::All(), _, _) => (0, self.clone()),
-            (Slice::Idx(i), HTuple::Leaf(_), HTuple::Leaf(s)) => {
-                (*i as i64 * s, Layout::new(shape!(0), stride!(1)))
-            }
-            (Slice::Tuple(slices), HTuple::Tuple(shapes), HTuple::Tuple(strides)) => {
-                let mut total_offset = 0i64;
-                let mut res_shapes = Vec::new();
-                let mut res_strides = Vec::new();
+        slice_impl(&self.shape, &self.stride, args)
+    }
+}
 
-                for (c_k, (s_k, d_k)) in zip(slices, zip(shapes, strides)) {
-                    let sub = Layout::new(s_k.clone(), d_k.clone());
-                    let (off, residual) = sub.slice(c_k);
-                    total_offset += off;
+fn slice_impl(shape: &Shape, stride: &Stride, args: &Slice) -> (i64, Layout) {
+    match (args, shape, stride) {
+        (Slice::All, s, d) => (
+            0,
+            Layout {
+                shape: s.clone(),
+                stride: d.clone(),
+            },
+        ),
+        (Slice::Idx(i), HTuple::Leaf(_), HTuple::Leaf(s)) => (
+            *i as i64 * s,
+            Layout {
+                shape: HTuple::Leaf(0),
+                stride: HTuple::Leaf(1),
+            },
+        ),
+        (Slice::Tuple(slices), HTuple::Tuple(shapes), HTuple::Tuple(strides)) => {
+            let mut total_offset = 0i64;
+            let mut res_shapes = Vec::new();
+            let mut res_strides = Vec::new();
 
-                    if size(&residual.shape) > 1 {
-                        res_shapes.push(residual.shape);
-                        res_strides.push(residual.stride);
-                    }
+            for (c_k, (s_k, d_k)) in zip(slices, zip(shapes, strides)) {
+                let (off, residual) = slice_impl(s_k, d_k, c_k);
+                total_offset += off;
+                if size(&residual.shape) > 1 {
+                    res_shapes.push(residual.shape);
+                    res_strides.push(residual.stride);
                 }
+            }
 
-                let res_layout = match res_shapes.len() {
-                    0 => Layout::new(shape!(1), stride!(0)),
-                    1 => Layout::new(res_shapes.pop().unwrap(), res_strides.pop().unwrap()),
-                    _ => Layout::new(HTuple::Tuple(res_shapes), HTuple::Tuple(res_strides)),
-                };
-                (total_offset, res_layout)
-            }
-            (Slice::Idx(c), HTuple::Tuple(_), _) => {
-                let sl = htuple2slice(idx2crd(*c, &self.shape));
-                self.slice(&sl)
-            }
-            _ => panic!("not weakly congruent."),
+            let layout = match res_shapes.len() {
+                0 => Layout {
+                    shape: HTuple::Leaf(1),
+                    stride: HTuple::Leaf(0),
+                },
+                1 => Layout {
+                    shape: res_shapes.pop().unwrap(),
+                    stride: res_strides.pop().unwrap(),
+                },
+                _ => Layout {
+                    shape: HTuple::Tuple(res_shapes),
+                    stride: HTuple::Tuple(res_strides),
+                },
+            };
+            (total_offset, layout)
         }
+        (Slice::Idx(c), HTuple::Tuple(_), _) => {
+            let sl = htuple2slice(idx2crd(*c, shape));
+            slice_impl(shape, stride, &sl)
+        }
+        _ => panic!("not weakly congruent."),
     }
 }
 
@@ -250,26 +291,37 @@ pub fn flatten_layout(shape: &Shape, stride: &Stride) -> Vec<(u64, i64)> {
     }
 }
 
-/// Assemble a vec of Layouts into a single Layout.
 fn build_layout_from_layouts(layouts: Vec<Layout>) -> Layout {
-    let shapes: Vec<_> = layouts.iter().map(|l| l.shape.clone()).collect();
-    let strides: Vec<_> = layouts.iter().map(|l| l.stride.clone()).collect();
-
     match layouts.len() {
-        0 => Layout::new(shape!(1), stride!(0)),
-        1 => Layout::new(shapes[0].clone(), strides[0].clone()),
-        _ => Layout::new(HTuple::Tuple(shapes), HTuple::Tuple(strides)),
+        0 => Layout {
+            shape: HTuple::Leaf(1),
+            stride: HTuple::Leaf(0),
+        },
+        1 => layouts.into_iter().next().unwrap(),
+        _ => {
+            let (shapes, strides) = layouts.into_iter().map(|l| (l.shape, l.stride)).unzip();
+            Layout {
+                shape: HTuple::Tuple(shapes),
+                stride: HTuple::Tuple(strides),
+            }
+        }
     }
 }
 
 pub fn build_layout_from_pairs(pairs: Vec<(u64, i64)>) -> Layout {
     match pairs.len() {
-        0 => Layout::new(shape!(1), stride!(0)),
-        1 => Layout::new(HTuple::Leaf(pairs[0].0), HTuple::Leaf(pairs[0].1)),
-        _ => Layout::new(
-            HTuple::Tuple(pairs.iter().map(|(s, _)| HTuple::Leaf(*s)).collect()),
-            HTuple::Tuple(pairs.iter().map(|(_, d)| HTuple::Leaf(*d)).collect()),
-        ),
+        0 => Layout {
+            shape: HTuple::Leaf(1),
+            stride: HTuple::Leaf(0),
+        },
+        1 => Layout {
+            shape: HTuple::Leaf(pairs[0].0),
+            stride: HTuple::Leaf(pairs[0].1),
+        },
+        _ => Layout {
+            shape: HTuple::Tuple(pairs.iter().map(|(s, _)| HTuple::Leaf(*s)).collect()),
+            stride: HTuple::Tuple(pairs.iter().map(|(_, d)| HTuple::Leaf(*d)).collect()),
+        },
     }
 }
 
@@ -280,7 +332,10 @@ pub fn coalesce(layout: &Layout) -> Layout {
     pairs.retain(|&(s, _)| s != 1);
 
     if pairs.is_empty() {
-        return Layout::new(shape!(1), stride!(0));
+        return Layout {
+            shape: HTuple::Leaf(1),
+            stride: HTuple::Leaf(0),
+        };
     }
 
     //greedy merge the pairs back together
@@ -299,26 +354,24 @@ pub fn coalesce(layout: &Layout) -> Layout {
 }
 
 /// Compose A ∘ (s : d) where A is already coalesced and d >= 0
-fn simple_compose(a: &Layout, s: u64, d: u64) -> Layout {
+fn simple_compose(a: &Layout, s: u64, d: u64) -> Result<Layout, LayoutError> {
     let pairs = flatten_layout(&a.shape, &a.stride);
 
     let mut result = Vec::new();
     let mut remaining_d = d;
 
-    // Step 1: "Divide out" d from left to right
     for &(s_r, d_r) in &pairs {
         if remaining_d == 0 {
-            // Past the division point, mode passes through unchanged
             result.push((s_r, d_r));
         } else if remaining_d >= s_r {
-            // This mode is fully consumed by d
-            // Check: d must be divisible by s_r
-            assert!(remaining_d % s_r == 0, "stride divisibility violated");
+            if remaining_d % s_r != 0 {
+                return Err(LayoutError::Divisibility);
+            }
             remaining_d /= s_r;
-            // Mode collapses to size 1, effectively gone
         } else {
-            // Partial consumption: d < s_r, so s_r must be divisible by d
-            assert!(s_r % remaining_d == 0, "stride divisibility violated");
+            if s_r % remaining_d != 0 {
+                return Err(LayoutError::Divisibility);
+            }
             let new_size = s_r / remaining_d;
             let new_stride = d_r * remaining_d as i64;
             remaining_d = 0;
@@ -329,8 +382,11 @@ fn simple_compose(a: &Layout, s: u64, d: u64) -> Layout {
     result.retain(|&(s, _)| s != 1);
 
     if result.is_empty() {
-        return Layout::new(shape!(1), stride!(0));
-    };
+        return Ok(Layout {
+            shape: HTuple::Leaf(1),
+            stride: HTuple::Leaf(0),
+        });
+    }
 
     let current_size: u64 = result.iter().map(|(sh, _)| sh).product();
     if current_size != s {
@@ -338,27 +394,32 @@ fn simple_compose(a: &Layout, s: u64, d: u64) -> Layout {
             .iter()
             .map(|(sh, _)| sh)
             .product();
-        assert!(s % prefix == 0, "shape divisibility violated");
+        if s % prefix != 0 {
+            return Err(LayoutError::Divisibility);
+        }
         result.last_mut().unwrap().0 = s / prefix;
     }
-    build_layout_from_pairs(result)
+    Ok(build_layout_from_pairs(result))
 }
 
-pub fn compose(lhs: &Layout, rhs: &Layout) -> Layout {
+pub fn compose(lhs: &Layout, rhs: &Layout) -> Result<Layout, LayoutError> {
     let lhs = coalesce(lhs);
 
     match (&rhs.shape, &rhs.stride) {
-        // base case, rank(B) = 1, depth(B) = 0
         (HTuple::Leaf(s), HTuple::Leaf(d)) => simple_compose(&lhs, *s, *d as u64),
-        // distributive case, A ∘ B = A ∘ (B0, B1, ...) = (A ∘ B0, A ∘ B1, ...)
         (HTuple::Tuple(sv), HTuple::Tuple(dv)) => {
-            let subs: Vec<_> = zip(sv, dv)
+            let subs = zip(sv, dv)
                 .map(|(sk, dk)| {
-                    let rhs_k = Layout::new(sk.clone(), dk.clone());
-                    compose(&lhs, &rhs_k)
+                    compose(
+                        &lhs,
+                        &Layout {
+                            shape: sk.clone(),
+                            stride: dk.clone(),
+                        },
+                    )
                 })
-                .collect();
-            build_layout_from_layouts(subs)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(build_layout_from_layouts(subs))
         }
         _ => panic!("rhs incongruent with itself"),
     }
@@ -370,7 +431,7 @@ impl fmt::Display for Slice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Slice::Idx(v) => write!(f, "{v}"),
-            Slice::All() => write!(f, ":"),
+            Slice::All => write!(f, ":"),
             Slice::Tuple(v) => {
                 write!(f, "(")?;
                 for (i, x) in v.iter().enumerate() {
@@ -405,9 +466,7 @@ impl<T: fmt::Display> fmt::Display for HTuple<T> {
 
 impl fmt::Display for Layout {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let shape = &self.shape;
-        let stride = &self.stride;
-        write!(f, "{shape} : {stride}")
+        write!(f, "{} : {}", self.shape, self.stride)
     }
 }
 
@@ -496,11 +555,9 @@ mod tests {
         assert_eq!(s.get(1), &leaf(20));
     }
 
-    // #[test]
-    // #[should_panic(expected = "Cannot index into a leaf")]
-    // fn get_leaf_panics() {
-    //     leaf(5).get(0);
-    // }
+    #[test]
+    #[should_panic(expected = "Cannot index into a leaf")]
+    fn get_leaf_panics() { leaf(5).get(0); }
 
     // -- size --
 
@@ -634,30 +691,42 @@ mod tests {
         assert!(!compatible(&p, &s));
     }
 
-    // -- Layout display --
+    // -- Layout --
 
     #[test]
     fn display_layout() {
-        let layout = Layout {
-            shape: tup(vec![leaf(2), leaf(3)]),
-            stride: HTuple::Tuple(vec![HTuple::Leaf(1), HTuple::Leaf(2)]),
-        };
+        let layout = Layout::new(shape!((2, 3)), stride!((1, 2))).unwrap();
         println!("{layout}");
         assert_eq!(format!("{layout}"), "(2, 3) : (1, 2)");
+    }
+
+    #[test]
+    fn layout_new_not_congruent() {
+        assert_eq!(
+            Layout::new(shape!((2, 3)), stride!(1)),
+            Err(LayoutError::NotCongruent)
+        );
+    }
+
+    #[test]
+    fn layout_accessors() {
+        let layout = Layout::new(shape!((4, 3)), stride!((3, 1))).unwrap();
+        assert_eq!(layout.shape(), &shape!((4, 3)));
+        assert_eq!(layout.stride(), &stride!((3, 1)));
     }
 
     // -- Slice display --
 
     #[test]
     fn display_slice() {
-        let s = slice!((_, 2));
+        let s = sl!((_, 2));
         println!("{s}");
         assert_eq!(format!("{s}"), "(:, 2)");
     }
 
     #[test]
     fn display_slice_nested() {
-        let s = slice!(((_, 3), _));
+        let s = sl!(((_, 3), _));
         println!("{s}");
         assert_eq!(format!("{s}"), "((:, 3), :)");
     }
@@ -667,8 +736,8 @@ mod tests {
     #[test]
     fn slice_row_from_rowmajor() {
         // (4,3):(3,1) — 4x3 row-major, fix row=2 → offset=6, column layout 3:1
-        let layout = Layout::new(shape!((4, 3)), stride!((3, 1)));
-        let (off, sub) = layout.slice(&slice!((2, _)));
+        let layout = Layout::new(shape!((4, 3)), stride!((3, 1))).unwrap();
+        let (off, sub) = layout.slice(&sl!((2, _)));
         println!("slice({layout}, (2, :)) = off={off}, {sub}");
         assert_eq!(off, 6);
         assert_eq!(format!("{sub}"), "3 : 1");
@@ -677,8 +746,8 @@ mod tests {
     #[test]
     fn slice_col_from_rowmajor() {
         // (4,3):(3,1) — fix col=1 → offset=1, row layout 4:3
-        let layout = Layout::new(shape!((4, 3)), stride!((3, 1)));
-        let (off, sub) = layout.slice(&slice!((_, 1)));
+        let layout = Layout::new(shape!((4, 3)), stride!((3, 1))).unwrap();
+        let (off, sub) = layout.slice(&sl!((_, 1)));
         println!("slice({layout}, (:, 1)) = off={off}, {sub}");
         assert_eq!(off, 1);
         assert_eq!(format!("{sub}"), "4 : 3");
@@ -687,8 +756,8 @@ mod tests {
     #[test]
     fn slice_row_from_colmajor() {
         // (4,3):(1,4) — 4x3 col-major, fix row=2 → offset=2, col layout 3:4
-        let layout = Layout::new(shape!((4, 3)), stride!((1, 4)));
-        let (off, sub) = layout.slice(&slice!((2, _)));
+        let layout = Layout::new(shape!((4, 3)), stride!((1, 4))).unwrap();
+        let (off, sub) = layout.slice(&sl!((2, _)));
         println!("slice({layout}, (2, :)) = off={off}, {sub}");
         assert_eq!(off, 2);
         assert_eq!(format!("{sub}"), "3 : 4");
@@ -696,18 +765,18 @@ mod tests {
 
     #[test]
     fn slice_all_preserves_layout() {
-        let layout = Layout::new(shape!((4, 3)), stride!((3, 1)));
-        let (off, sub) = layout.slice(&slice!(_));
+        let layout = Layout::new(shape!((4, 3)), stride!((3, 1))).unwrap();
+        let (off, sub) = layout.slice(&sl!(_));
         println!("slice({layout}, :) = off={off}, {sub}");
         assert_eq!(off, 0);
-        assert_eq!(format!("{sub}"), format!("{layout}"));
+        assert_eq!(sub, layout);
     }
 
     #[test]
     fn slice_flat_idx_into_tuple() {
         // (4,3):(3,1) — flat idx 5 → coord (1,1) → offset 1*3+1*1=4
-        let layout = Layout::new(shape!((4, 3)), stride!((3, 1)));
-        let (off, sub) = layout.slice(&slice!(5));
+        let layout = Layout::new(shape!((4, 3)), stride!((3, 1))).unwrap();
+        let (off, sub) = layout.slice(&sl!(5));
         println!("slice({layout}, 5) = off={off}, {sub}");
         assert_eq!(off, 4);
     }
@@ -715,8 +784,8 @@ mod tests {
     #[test]
     fn slice_nested_shape() {
         // ((2,4), 3):((1,2), 8) — fix mode-1 to 1, keep nested mode-0
-        let layout = Layout::new(shape!(((2, 4), 3)), stride!(((1, 2), 8)));
-        let (off, sub) = layout.slice(&slice!((_, 1)));
+        let layout = Layout::new(shape!(((2, 4), 3)), stride!(((1, 2), 8))).unwrap();
+        let (off, sub) = layout.slice(&sl!((_, 1)));
         println!("slice({layout}, (:, 1)) = off={off}, {sub}");
         assert_eq!(off, 8);
         assert_eq!(format!("{sub}"), "(2, 4) : (1, 2)");
@@ -727,7 +796,7 @@ mod tests {
     #[test]
     fn coalesce_contiguous() {
         // (4, 8):(1, 4) → 32:1 — modes are contiguous (4*1 == 4)
-        let layout = Layout::new(shape!((4, 8)), stride!((1, 4)));
+        let layout = Layout::new(shape!((4, 8)), stride!((1, 4))).unwrap();
         let c = coalesce(&layout);
         println!("coalesce({layout}) = {c}");
         assert_eq!(format!("{c}"), "32 : 1");
@@ -736,7 +805,7 @@ mod tests {
     #[test]
     fn coalesce_non_contiguous() {
         // (4, 8):(1, 8) — gap between modes (4*1 != 8), no merge
-        let layout = Layout::new(shape!((4, 8)), stride!((1, 8)));
+        let layout = Layout::new(shape!((4, 8)), stride!((1, 8))).unwrap();
         let c = coalesce(&layout);
         println!("coalesce({layout}) = {c}");
         assert_eq!(format!("{c}"), "(4, 8) : (1, 8)");
@@ -745,7 +814,7 @@ mod tests {
     #[test]
     fn coalesce_removes_unit_dims() {
         // (1, 4, 8):(5, 1, 4) → squeeze unit dim, then 4 and 8 are contiguous
-        let layout = Layout::new(shape!((1, 4, 8)), stride!((5, 1, 4)));
+        let layout = Layout::new(shape!((1, 4, 8)), stride!((5, 1, 4))).unwrap();
         let c = coalesce(&layout);
         println!("coalesce({layout}) = {c}");
         assert_eq!(format!("{c}"), "32 : 1");
@@ -754,7 +823,7 @@ mod tests {
     #[test]
     fn coalesce_all_unit_dims() {
         // (1, 1, 1):(3, 5, 7) → everything squeezed
-        let layout = Layout::new(shape!((1, 1, 1)), stride!((3, 5, 7)));
+        let layout = Layout::new(shape!((1, 1, 1)), stride!((3, 5, 7))).unwrap();
         let c = coalesce(&layout);
         println!("coalesce({layout}) = {c}");
         assert_eq!(format!("{c}"), "1 : 0");
@@ -763,7 +832,7 @@ mod tests {
     #[test]
     fn coalesce_nested_contiguous() {
         // ((2, 4), 8):((1, 2), 8) — flattens to (2,4,8):(1,2,8), all contiguous → 64:1
-        let layout = Layout::new(shape!(((2, 4), 8)), stride!(((1, 2), 8)));
+        let layout = Layout::new(shape!(((2, 4), 8)), stride!(((1, 2), 8))).unwrap();
         let c = coalesce(&layout);
         println!("coalesce({layout}) = {c}");
         assert_eq!(format!("{c}"), "64 : 1");
@@ -772,7 +841,7 @@ mod tests {
     #[test]
     fn coalesce_partial_merge() {
         // (2, 4, 3):(1, 2, 16) — first two contiguous (2*1==2), third is not (8!=16)
-        let layout = Layout::new(shape!((2, 4, 3)), stride!((1, 2, 16)));
+        let layout = Layout::new(shape!((2, 4, 3)), stride!((1, 2, 16))).unwrap();
         let c = coalesce(&layout);
         println!("coalesce({layout}) = {c}");
         assert_eq!(format!("{c}"), "(8, 3) : (1, 16)");
@@ -781,7 +850,7 @@ mod tests {
     #[test]
     fn coalesce_already_minimal() {
         // single mode, nothing to merge
-        let layout = Layout::new(shape!(16), stride!(2));
+        let layout = Layout::new(shape!(16), stride!(2)).unwrap();
         let c = coalesce(&layout);
         println!("coalesce({layout}) = {c}");
         assert_eq!(format!("{c}"), "16 : 2");
@@ -792,9 +861,9 @@ mod tests {
     #[test]
     fn compose_leaf_leaf_unit_stride() {
         // compose(8:2, 4:1) = 4:2 — take first 4 elements, preserve stride
-        let a = Layout::new(shape!(8), stride!(2));
-        let b = Layout::new(shape!(4), stride!(1));
-        let c = compose(&a, &b);
+        let a = Layout::new(shape!(8), stride!(2)).unwrap();
+        let b = Layout::new(shape!(4), stride!(1)).unwrap();
+        let c = compose(&a, &b).unwrap();
         println!("compose({a}, {b}) = {c}");
         assert_eq!(format!("{c}"), "4 : 2");
     }
@@ -802,9 +871,9 @@ mod tests {
     #[test]
     fn compose_leaf_leaf_strided() {
         // compose(8:2, 2:4) = 2:8 — every 4th element of A, strides multiply
-        let a = Layout::new(shape!(8), stride!(2));
-        let b = Layout::new(shape!(2), stride!(4));
-        let c = compose(&a, &b);
+        let a = Layout::new(shape!(8), stride!(2)).unwrap();
+        let b = Layout::new(shape!(2), stride!(4)).unwrap();
+        let c = compose(&a, &b).unwrap();
         println!("compose({a}, {b}) = {c}");
         assert_eq!(format!("{c}"), "2 : 8");
     }
@@ -812,9 +881,9 @@ mod tests {
     #[test]
     fn compose_multimodal_a_skip_mode() {
         // compose((4,3):(1,4), 3:4) — B steps by 4, skips mode-0 entirely → 3:4
-        let a = Layout::new(shape!((4, 3)), stride!((1, 4)));
-        let b = Layout::new(shape!(3), stride!(4));
-        let c = compose(&a, &b);
+        let a = Layout::new(shape!((4, 3)), stride!((1, 4))).unwrap();
+        let b = Layout::new(shape!(3), stride!(4)).unwrap();
+        let c = compose(&a, &b).unwrap();
         println!("compose({a}, {b}) = {c}");
         assert_eq!(format!("{c}"), "3 : 4");
     }
@@ -822,9 +891,9 @@ mod tests {
     #[test]
     fn compose_multimodal_a_within_mode() {
         // compose((4,3):(1,4), 2:1) — take first 2 from mode-0 → 2:1
-        let a = Layout::new(shape!((4, 3)), stride!((1, 4)));
-        let b = Layout::new(shape!(2), stride!(1));
-        let c = compose(&a, &b);
+        let a = Layout::new(shape!((4, 3)), stride!((1, 4))).unwrap();
+        let b = Layout::new(shape!(2), stride!(1)).unwrap();
+        let c = compose(&a, &b).unwrap();
         println!("compose({a}, {b}) = {c}");
         assert_eq!(format!("{c}"), "2 : 1");
     }
@@ -832,9 +901,9 @@ mod tests {
     #[test]
     fn compose_leaf_a_multimodal_b() {
         // compose(32:2, (4,8):(1,4)) = (4,8):(2,8) — distributes, strides scale by 2
-        let a = Layout::new(shape!(32), stride!(2));
-        let b = Layout::new(shape!((4, 8)), stride!((1, 4)));
-        let c = compose(&a, &b);
+        let a = Layout::new(shape!(32), stride!(2)).unwrap();
+        let b = Layout::new(shape!((4, 8)), stride!((1, 4))).unwrap();
+        let c = compose(&a, &b).unwrap();
         println!("compose({a}, {b}) = {c}");
         assert_eq!(format!("{c}"), "(4, 8) : (2, 8)");
     }
@@ -842,9 +911,9 @@ mod tests {
     #[test]
     fn compose_identity_tiling() {
         // compose(32:1, (4,8):(1,4)) = (4,8):(1,4) — contiguous A with tiled B
-        let a = Layout::new(shape!(32), stride!(1));
-        let b = Layout::new(shape!((4, 8)), stride!((1, 4)));
-        let c = compose(&a, &b);
+        let a = Layout::new(shape!(32), stride!(1)).unwrap();
+        let b = Layout::new(shape!((4, 8)), stride!((1, 4))).unwrap();
+        let c = compose(&a, &b).unwrap();
         println!("compose({a}, {b}) = {c}");
         assert_eq!(format!("{c}"), "(4, 8) : (1, 4)");
     }
@@ -852,9 +921,9 @@ mod tests {
     #[test]
     fn compose_nested_a_coalesced() {
         // ((2,4),8):((1,2),8) coalesces to 64:1, then compose with 4:1 → 4:1
-        let a = Layout::new(shape!(((2, 4), 8)), stride!(((1, 2), 8)));
-        let b = Layout::new(shape!(4), stride!(1));
-        let c = compose(&a, &b);
+        let a = Layout::new(shape!(((2, 4), 8)), stride!(((1, 2), 8))).unwrap();
+        let b = Layout::new(shape!(4), stride!(1)).unwrap();
+        let c = compose(&a, &b).unwrap();
         println!("compose({a}, {b}) = {c}");
         assert_eq!(format!("{c}"), "4 : 1");
     }
@@ -862,9 +931,9 @@ mod tests {
     #[test]
     fn compose_brute_force() {
         // verify compose pointwise: compose(A, B)(i) == A(B(i))
-        let a = Layout::new(shape!((4, 3)), stride!((1, 4)));
-        let b = Layout::new(shape!((2, 3)), stride!((1, 2)));
-        let c = compose(&a, &b);
+        let a = Layout::new(shape!((4, 3)), stride!((1, 4))).unwrap();
+        let b = Layout::new(shape!((2, 3)), stride!((1, 2))).unwrap();
+        let c = compose(&a, &b).unwrap();
         println!("compose({a}, {b}) = {c}");
         for i in 0..c.size() {
             let expected = a.call(b.call(i) as u64);
@@ -875,4 +944,46 @@ mod tests {
             );
         }
     }
+
+    // -- idx2crd / crd2idx roundtrip --
+
+    #[test]
+    fn idx_crd_roundtrip_flat() {
+        let shape = shape!((4, 3));
+        for i in 0..size(&shape) {
+            assert_eq!(crd2idx(&idx2crd(i, &shape), &shape), i);
+        }
+    }
+
+    #[test]
+    fn idx_crd_roundtrip_nested() {
+        let shape = shape!(((2, 4), 3));
+        for i in 0..size(&shape) {
+            assert_eq!(crd2idx(&idx2crd(i, &shape), &shape), i);
+        }
+    }
+
+    #[test]
+    fn idx_crd_roundtrip_leaf() {
+        let shape = shape!(8);
+        for i in 0..size(&shape) {
+            assert_eq!(crd2idx(&idx2crd(i, &shape), &shape), i);
+        }
+    }
+
+    // -- should_panic --
+
+    #[test]
+    #[should_panic(expected = "incompatible coordinates")]
+    fn crd2idx_incompatible() { crd2idx(&HTuple::Tuple(vec![HTuple::Leaf(1)]), &HTuple::Leaf(5)); }
+
+    #[test]
+    #[should_panic(expected = "not congruent")]
+    fn inner_product_not_congruent() {
+        inner_product(&HTuple::Tuple(vec![HTuple::Leaf(1)]), &HTuple::Leaf(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot take sublayout")]
+    fn sublayout_rank1_panics() { Layout::new(shape!(8), stride!(1)).unwrap().sublayout(0); }
 }
