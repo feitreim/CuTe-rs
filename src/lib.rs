@@ -148,6 +148,13 @@ pub fn inner_product(coord: &Coord, stride: &Stride) -> i64 {
     }
 }
 
+pub fn htuple2slice(coord: Coord) -> Slice {
+    match coord {
+        HTuple::Leaf(c) => Slice::Idx(c),
+        HTuple::Tuple(v) => Slice::Tuple(v.into_iter().map(htuple2slice).collect()),
+    }
+}
+
 // ------------------------------------------------------------------
 // Layout definition and functions
 
@@ -220,20 +227,52 @@ impl Layout {
                 (total_offset, res_layout)
             }
             (Slice::Idx(c), HTuple::Tuple(_), _) => {
-                let s = htuple2slice(idx2crd(*c, &self.shape));
-                self.slice(&s)
+                let sl = htuple2slice(idx2crd(*c, &self.shape));
+                self.slice(&sl)
             }
             _ => panic!("not weakly congruent.")
         }
     }
 }
 
-
-pub fn htuple2slice(coord: Coord) -> Slice {
-    match coord {
-        HTuple::Leaf(c) => Slice::Idx(c),
-        HTuple::Tuple(v) => Slice::Tuple(v.into_iter().map(htuple2slice).collect()),
+/// Flatten a layout into S:D pairs
+pub fn flatten_layout(shape: &Shape, stride: &Stride) -> Vec<(u64, i64)> {
+    match (shape, stride) {
+        (HTuple::Leaf(s), HTuple::Leaf(d)) => vec![(*s, *d)],
+        (HTuple::Tuple(sv), HTuple::Tuple(dv)) => zip(sv, dv).flat_map(|(s, d)| flatten_layout(s, d)).collect(),
+        _ => panic!("not congruent! (how did you get here)")
     }
+}
+
+pub fn coalesce(layout: &Layout) -> Layout {
+    let mut pairs = flatten_layout(&layout.shape, &layout.stride);
+    // squeeze (like pytorch remove 1 dims)
+    pairs.retain(|&(s, _)| s != 1);
+
+    if pairs.is_empty() {
+        return Layout::new(shape!(1), stride!(0));
+    }
+
+    //greedy merge the pairs back together
+    let mut merged = vec![pairs[0]];
+    for &(s, d) in &pairs[1..] {
+        let last = merged.last_mut().unwrap();
+        if last.0 as i64 * last.1 == d {
+            // contiguous case so we extend the previous mode
+            last.0 *= s;
+        } else {
+            merged.push((s, d));
+        }
+    }
+
+    let new_shape: Vec<Shape> = merged.iter().map(|(s, _)| HTuple::Leaf(*s)).collect();
+    let new_stride: Vec<Stride> = merged.iter().map(|(_, d)| HTuple::Leaf(*d)).collect();
+
+    match merged.len() {
+        1 => Layout::new(new_shape[0].clone(), new_stride[0].clone()),
+        _ => Layout::new(HTuple::Tuple(new_shape), HTuple::Tuple(new_stride)),
+    }
+
 }
 
 // print formatting
@@ -591,5 +630,70 @@ mod tests {
         println!("slice({layout}, (:, 1)) = off={off}, {sub}");
         assert_eq!(off, 8);
         assert_eq!(format!("{sub}"), "(2, 4) : (1, 2)");
+    }
+
+    // -- coalesce --
+
+    #[test]
+    fn coalesce_contiguous() {
+        // (4, 8):(1, 4) → 32:1 — modes are contiguous (4*1 == 4)
+        let layout = Layout::new(shape!((4, 8)), stride!((1, 4)));
+        let c = coalesce(&layout);
+        println!("coalesce({layout}) = {c}");
+        assert_eq!(format!("{c}"), "32 : 1");
+    }
+
+    #[test]
+    fn coalesce_non_contiguous() {
+        // (4, 8):(1, 8) — gap between modes (4*1 != 8), no merge
+        let layout = Layout::new(shape!((4, 8)), stride!((1, 8)));
+        let c = coalesce(&layout);
+        println!("coalesce({layout}) = {c}");
+        assert_eq!(format!("{c}"), "(4, 8) : (1, 8)");
+    }
+
+    #[test]
+    fn coalesce_removes_unit_dims() {
+        // (1, 4, 8):(5, 1, 4) → squeeze unit dim, then 4 and 8 are contiguous
+        let layout = Layout::new(shape!((1, 4, 8)), stride!((5, 1, 4)));
+        let c = coalesce(&layout);
+        println!("coalesce({layout}) = {c}");
+        assert_eq!(format!("{c}"), "32 : 1");
+    }
+
+    #[test]
+    fn coalesce_all_unit_dims() {
+        // (1, 1, 1):(3, 5, 7) → everything squeezed
+        let layout = Layout::new(shape!((1, 1, 1)), stride!((3, 5, 7)));
+        let c = coalesce(&layout);
+        println!("coalesce({layout}) = {c}");
+        assert_eq!(format!("{c}"), "1 : 0");
+    }
+
+    #[test]
+    fn coalesce_nested_contiguous() {
+        // ((2, 4), 8):((1, 2), 8) — flattens to (2,4,8):(1,2,8), all contiguous → 64:1
+        let layout = Layout::new(shape!(((2, 4), 8)), stride!(((1, 2), 8)));
+        let c = coalesce(&layout);
+        println!("coalesce({layout}) = {c}");
+        assert_eq!(format!("{c}"), "64 : 1");
+    }
+
+    #[test]
+    fn coalesce_partial_merge() {
+        // (2, 4, 3):(1, 2, 16) — first two contiguous (2*1==2), third is not (8!=16)
+        let layout = Layout::new(shape!((2, 4, 3)), stride!((1, 2, 16)));
+        let c = coalesce(&layout);
+        println!("coalesce({layout}) = {c}");
+        assert_eq!(format!("{c}"), "(8, 3) : (1, 16)");
+    }
+
+    #[test]
+    fn coalesce_already_minimal() {
+        // single mode, nothing to merge
+        let layout = Layout::new(shape!(16), stride!(2));
+        let c = coalesce(&layout);
+        println!("coalesce({layout}) = {c}");
+        assert_eq!(format!("{c}"), "16 : 2");
     }
 }
