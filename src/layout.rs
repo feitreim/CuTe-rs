@@ -22,14 +22,6 @@ pub enum LayoutError {
     Divisibility,
 }
 
-impl fmt::Display for LayoutError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LayoutError::NotCongruent => write!(f, "shape and stride not congruent"),
-            LayoutError::Divisibility => write!(f, "stride/shape divisibility violated"),
-        }
-    }
-}
 
 impl std::error::Error for LayoutError {}
 
@@ -469,6 +461,16 @@ impl fmt::Display for Layout {
         write!(f, "{} : {}", self.shape, self.stride)
     }
 }
+
+impl fmt::Display for LayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LayoutError::NotCongruent => write!(f, "shape and stride not congruent"),
+            LayoutError::Divisibility => write!(f, "stride/shape divisibility violated"),
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
